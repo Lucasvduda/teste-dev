@@ -44,6 +44,4 @@ NestJS + TypeScript. Fora isso, use o que fizer sentido.
 
 ## Como entregar
 
-Fork este repositório, implemente, e envie o link para [matheus.morett@monest.com.br](mailto:matheus.morett@monest.com.br) com o assunto **Teste Dev - Monest**.
-
-Se o repositório for privado, adicione `matheusmorett2` como colaborador.
+Fork este repositório, implemente. Retorne ao e-mail em que você recebeu o teste e encaminhe seu resultado por lá com o assunto **Teste Dev - Monest**.
