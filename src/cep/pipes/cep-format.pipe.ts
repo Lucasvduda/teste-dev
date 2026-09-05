@@ -1,5 +1,6 @@
 import { Injectable, PipeTransform } from '@nestjs/common';
 import { InvalidCepFormatException } from '../errors/http.exceptions';
+import { normalizeCepOrNull } from '../utils/cep-format.util';
 
 /**
  * Valida e normaliza o parametro :cep antes dele chegar no controller.
@@ -10,10 +11,10 @@ import { InvalidCepFormatException } from '../errors/http.exceptions';
 @Injectable()
 export class CepFormatPipe implements PipeTransform<string, string> {
   transform(value: string): string {
-    const digits = (value ?? '').replace(/\D/g, '');
-    if (digits.length !== 8) {
+    const normalized = normalizeCepOrNull(value);
+    if (!normalized) {
       throw new InvalidCepFormatException(value);
     }
-    return digits;
+    return normalized;
   }
 }

@@ -6,18 +6,22 @@ import { AppModule } from './app.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { AppLogger } from './common/logger/app-logger.service';
 import { requestIdMiddleware } from './common/middleware/request-id.middleware';
+import { createValidationPipe } from './common/pipes/validation-pipe.factory';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, { logger: new AppLogger() });
 
   app.use(requestIdMiddleware);
+  app.useGlobalPipes(createValidationPipe());
   app.useGlobalFilters(new AllExceptionsFilter());
 
   const config = app.get(ConfigService);
   const port = Number(config.get('PORT', 3000));
 
   await app.listen(port);
-  new Logger('Bootstrap').log(`CEP API rodando em http://localhost:${port} (GET /cep/:cep, GET /health)`);
+  new Logger('Bootstrap').log(
+    `CEP API rodando em http://localhost:${port} (GET /cep/:cep, POST /webhooks/cep-batch, GET /health)`,
+  );
 }
 
 bootstrap();

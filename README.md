@@ -68,8 +68,8 @@ Não precisa de `.env` para rodar (todo valor tem default sensato); `.env.exampl
 
 ```bash
 npm run build      # compila TS sem erros (tsc --strict)
-npm run test        # 39 testes unitários (providers, service, pipe, rotator, circuit breaker, logger)
-npm run test:e2e    # 8 testes ponta-a-ponta via supertest (HTTP mockado, sem chamada de rede real)
+npm run test        # 72 testes unitários (providers, service, pipe, rotator, circuit breaker, logger, filas, repositorios, webhook, backoff...)
+npm run test:e2e    # 14 testes ponta-a-ponta via supertest (HTTP mockado, sem chamada de rede real)
 ```
 
 Todos os testes (unitários + e2e) e o build foram executados com sucesso durante o desenvolvimento. Os testes automatizados **nunca** chamam ViaCEP/BrasilAPI de verdade (determinismo/CI); a integração real foi validada manualmente:
@@ -80,6 +80,24 @@ GET /cep/30130010  -> 200 { ...                                          source:
 GET /cep/abc        -> 400 { error: "INVALID_CEP_FORMAT" }   (nenhum provider é chamado)
 GET /cep/00000-000  -> 404 { error: "CEP_NOT_FOUND" }         (os dois providers concordaram)
 ```
+
+## Stack da vaga x o que foi implementado
+
+A vaga (Monest, time de Integrações) pede `NestJS, BullMQ (ou Kafka, RabbitMQ e/ou SQS), MySQL, DynamoDB e AWS`, além de "filas e processamento assíncrono" e "consumir/integrar APIs de parceiros". Mapeamento honesto:
+
+| Pedido na vaga | Status neste projeto |
+|---|---|
+| NestJS + TypeScript | ✅ Todo o projeto (`GET /cep/{cep}` + extra) |
+| Consumir/integrar APIs de parceiros | ✅ ViaCEP + BrasilAPI, com abstração (`CepProvider`), failover e circuit breaker |
+| Filas / processamento assíncrono | ✅ `POST /webhooks/cep-batch` (202 + processamento fora do request) |
+| BullMQ | ✅ Driver real (`BullMqQueueDriver`, lib `bullmq` de verdade) - **opcional**, `QUEUE_DRIVER=bullmq`; testado com Redis **mockado** (sem Redis de verdade disponível aqui, ver seção "Drivers reais") |
+| MySQL | ✅ Driver real (`MySqlBatchJobRepository`, lib `mysql2` de verdade) - **opcional**, `DB_DRIVER=mysql`; testado com Pool **mockado** (sem MySQL de verdade disponível aqui) |
+| DynamoDB / AWS | ❌ Não implementado (ver "Próximos passos" abaixo) |
+| Idempotência, retry+backoff, dead letter | ✅ (não pedido no enunciado do teste, adicionado por reforçar o dia a dia da vaga) |
+
+**Por que os drivers reais são opcionais, não o default:** o enunciado do teste diz explicitamente que banco de dados e deploy não são avaliados - deixar Redis/MySQL como obrigatórios pra rodar o projeto seria pior, não melhor, pra quem for avaliar sem essa infra. O padrão (`memory`) sempre roda com `npm install && npm start`; os drivers reais existem, compilam, têm teste próprio e são plugáveis por `.env`, mas não são exigidos pra ver o resto funcionando.
+
+**Próximos passos (se a vaga pedir na prática):** um driver DynamoDB seguiria o mesmo padrão de `MySqlBatchJobRepository` (implementar `BatchJobRepositoryPort` com `@aws-sdk/client-dynamodb`), e AWS entraria naturalmente no lugar do MySQL/BullMQ locais (RDS MySQL, ElastiCache/MemoryDB pro Redis do BullMQ, ou SQS no lugar do BullMQ).
 
 ## Arquitetura, em 1 minuto
 
@@ -178,13 +196,119 @@ src/
     cep.service.ts          # Orquestração: rotação + failover + classificação de erro
     cep.controller.ts
     cep.module.ts            # Único lugar que registra quais providers existem
+  webhook/                  # extra: batch assincrono + webhook (ver secao dedicada abaixo)
   health/
   app.module.ts
   main.ts
 test/
   cep.e2e-spec.ts           # HTTP mockado, aplicação completa via supertest
+  webhook.e2e-spec.ts       # idem, para o fluxo de batch/webhook
 ```
+
+> Nota sobre o build: `tsconfig.json` usa `rootDir: "./"` (inclui `src/` e
+> `test/`), então o `tsc` gera `dist/src/**` (não `dist/**`) - é por isso
+> que `npm start` roda `node dist/src/main.js`, não `node dist/main.js`.
 
 ## O que ficou fora de propósito
 
 Frontend, banco de dados e deploy (conforme o enunciado). Também não há retry com backoff dentro do mesmo provider (ex.: tentar a ViaCEP 3x antes de desistir dela): o failover pro outro provider já cobre esse caso de forma mais rápida pro usuário, e retry-com-backoff-por-provider seria um próximo passo natural se quiséssemos mais uma camada de resiliência (documentado aqui como decisão consciente, não esquecimento).
+
+---
+
+## Extra: consulta em lote assíncrona com webhook (fila, idempotência, retry+backoff, dead letter)
+
+O enunciado pede só o `GET /cep/{cep}` síncrono acima, que funciona sozinho e cobre 100% do que foi pedido. Como a vaga da Monest (time de Integrações) cita explicitamente **filas, processamento assíncrono e webhooks** como parte do dia a dia, adicionei um segundo módulo, independente do primeiro, pra demonstrar esses padrões na prática - sem tocar em nada do `CepModule`.
+
+### `POST /webhooks/cep-batch`
+
+```json
+{
+  "idempotencyKey": "meu-lote-2026-09-05-01",
+  "ceps": ["01001000", "30130-010", "abc", "00000000"],
+  "webhookUrl": "https://cliente.example.com/callback"
+}
+```
+
+- **202 Accepted** imediato: `{ jobId, status: "pending", idempotent: false, requestId }`. O processamento roda depois, fora do ciclo request/response, numa fila (`QueueDriver` - em memória por padrão, ou **BullMQ + Redis real** via `QUEUE_DRIVER=bullmq`, ver seção "Drivers reais" abaixo).
+- **Idempotência:** reenviar a **mesma** `idempotencyKey` não cria um job novo nem reprocessa - devolve **200** com o job já existente (`idempotent: true`), igual ao padrão usado por APIs de pagamento (Stripe etc). Testado em `webhook.service.spec.ts` e `webhook.e2e-spec.ts`.
+- **Reaproveita o `CepService`:** cada CEP do lote passa pelo mesmo motor de abstração/failover/circuit breaker do endpoint síncrono. Um CEP inválido ou não encontrado dentro do lote só marca aquele item como `ok: false` - não derruba o job inteiro (sucesso parcial).
+- **Retry com backoff exponencial na entrega do webhook:** se o `webhookUrl` do cliente falhar (rede, timeout, 5xx), tenta de novo em 1s, 2s, 4s, 8s... (`WEBHOOK_MAX_ATTEMPTS`, `WEBHOOK_BACKOFF_BASE_MS`). Backoff testado isoladamente em `backoff.spec.ts` e `webhook-delivery.service.spec.ts`.
+- **Dead letter:** se todas as tentativas de entrega se esgotarem, o job vira `status: "dead_letter"` (não se perde) e passa a aparecer em `GET /webhooks/cep-batch/dead-letter` - visibilidade operacional pra reprocessar manualmente depois.
+
+### Outras rotas
+
+```
+GET /webhooks/cep-batch/:id            -> status + resultados do job
+GET /webhooks/cep-batch/dead-letter    -> jobs que esgotaram as tentativas de entrega
+```
+
+### Validado de ponta a ponta com infraestrutura real (não só mock)
+
+Além dos testes automatizados (`webhook.e2e-spec.ts`, HTTP mockado), rodei manualmente com o servidor real + um receptor de webhook HTTP real em `localhost:4000`:
+
+```
+POST /webhooks/cep-batch { ceps: ["01001-000", "30130010", "abc", "00000000"], webhookUrl: "http://localhost:4000/hook" }
+  -> 202 { status: "pending" }
+  -> (assincrono) status vira "delivered"; o receptor local recebeu o POST com os 4 resultados
+       (2 sucesso - um via ViaCEP, um via BrasilAPI -, 1 INVALID_CEP_FORMAT, 1 CEP_NOT_FOUND)
+
+Reenvio da mesma idempotencyKey -> 200 { idempotent: true }, nenhum provider foi chamado de novo
+
+POST .../cep-batch com webhookUrl apontando pra uma porta sem ningum escutando
+  -> 5 tentativas de entrega (ECONNREFUSED), backoff 1s/2s/4s/8s (~15s no total)
+  -> status final: "dead_letter", visivel em GET /webhooks/cep-batch/dead-letter
+```
+
+### Arquivos
+
+```
+src/webhook/
+  dto/create-batch-webhook.dto.ts          # validacao (class-validator): idempotencyKey, ceps[], webhookUrl
+  entities/batch-job.entity.ts
+  repository/
+    batch-job-repository.interface.ts       # contrato (BatchJobRepositoryPort) + token BATCH_JOB_REPOSITORY
+    in-memory-batch-job.repository.ts        # driver default: Map em memoria, zero infra
+    mysql-batch-job.repository.ts            # driver real: MySQL (mysql2), colunas JSON p/ ceps/results
+    mysql-pool.factory.ts                    # cria o Pool mysql2 (lazy - so conecta no 1o uso)
+    schema.sql                                # CREATE TABLE de referencia p/ o driver mysql
+  delivery/
+    backoff.ts                                # calculo puro do backoff exponencial
+    sleep.token.ts                             # sleep injetavel (testes nao esperam tempo real)
+    webhook-delivery.service.ts                 # retry + backoff na entrega do webhook do cliente
+  webhook.service.ts                              # fila + idempotencia + reuso do CepService + dead-letter
+  webhook.controller.ts
+  webhook.module.ts                                # factories QUEUE_DRIVER e BATCH_JOB_REPOSITORY (ver abaixo)
+src/common/queue/
+  queue-driver.interface.ts     # contrato (QueueDriver: registerProcessor + enqueue) + token QUEUE_DRIVER
+  in-memory-queue.driver.ts     # driver default: fila em processo, concorrencia 1, zero infra
+  bullmq-queue.driver.ts        # driver real: BullMQ + Redis (ioredis), Queue + Worker de verdade
+```
+
+### Drivers reais: BullMQ (fila) e MySQL (persistência) - a stack que a vaga pede
+
+A vaga cita explicitamente `NestJS, BullMQ (ou Kafka, RabbitMQ e/ou SQS), MySQL, DynamoDB e AWS`. Além da versão em memória (que garante que o projeto roda com `npm install && npm run start:dev`, sem exigir nenhuma infra pra ser avaliado), implementei os drivers **reais** de BullMQ e MySQL, seguindo o mesmo princípio de abstração do `CepProvider`: uma interface (`QueueDriver` / `BatchJobRepositoryPort`), duas implementações, e uma factory em `webhook.module.ts` que escolhe qual usar via `.env` - nada em `WebhookService` muda entre elas.
+
+```bash
+# .env - ligar os drivers reais (precisa de Redis/MySQL de verdade rodando)
+QUEUE_DRIVER=bullmq
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+DB_DRIVER=mysql
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=
+MYSQL_DATABASE=teste_dev
+# aplique src/webhook/repository/schema.sql no banco antes de subir
+```
+
+**Por que o default continua em memória:** o próprio enunciado do teste diz explicitamente que banco de dados e deploy não são avaliados. Forçar Redis/MySQL como obrigatórios pra rodar quebraria a entrega pra quem só faz `npm install && npm start` sem essa infra - pareceria pior, não melhor. Por isso os drivers reais são **opcionais e plugáveis**, exatamente como o `CepProvider`: dá pra ver o código de verdade sem depender dele pra avaliar o resto.
+
+**Honestidade sobre o teste desses drivers:** não há Docker/WSL disponível no ambiente onde este projeto foi desenvolvido, então não dava pra validar a conexão de rede real com Redis/MySQL de ponta a ponta. O que **foi** testado e validado:
+
+- `bullmq-queue.driver.spec.ts`: a lógica de *wiring* (o `enqueue` chama `Queue.add` com o payload certo, `registerProcessor` cria um `Worker` que delega pro processor registrado, `close()` fecha as duas conexões, os handlers de erro não lançam exceção) - com a lib `bullmq` **mockada** (`jest.mock('bullmq', ...)`), sem Redis real.
+- `mysql-batch-job.repository.spec.ts`: a lógica de SQL/mapeamento (quais queries são disparadas, como as linhas viram `BatchJob`, `JSON.parse`/`JSON.stringify` de `ceps`/`results`) - com um `Pool` **fake** (`{ execute: jest.fn() }`), sem MySQL real.
+- **Boot com os drivers reais selecionados, sem Redis/MySQL disponíveis:** subi o servidor com `QUEUE_DRIVER=bullmq DB_DRIVER=mysql` e sem nenhuma das duas infras rodando. A aplicação **inicializou e serviu HTTP normalmente** (`GET /health` respondeu 200) - o `ioredis` fica tentando reconectar em background (log `bullmq_worker_error` a cada ~1s) sem derrubar o processo, graças a `lazyConnect: true` e ao fato de `BullMqQueueDriver`/`MySqlBatchJobRepository` só serem instanciados (não registrados como `@Injectable()` do Nest) dentro da própria factory, só quando selecionados.
+
+O que eu **não** consigo afirmar sem Redis/MySQL de verdade: se a query SQL bate 100% com o schema em produção, ou se o comportamento de retry/reconexão do BullMQ é exatamente o esperado sob carga real. Isso é o próximo passo natural se a vaga pedir - documentado aqui como limitação conhecida, não como algo escondido.
